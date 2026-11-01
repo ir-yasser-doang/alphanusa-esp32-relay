@@ -16,7 +16,7 @@ const char* AP_PASSWORD_DEFAULT = "alphanusa098765";
 const char* MQTT_BROKER_DEFAULT = "202.10.37.231";
 const int   MQTT_PORT_DEFAULT   = 1883;
 const char* MQTT_DEVICE_ID_DEFAULT = "DEV-001";
-const char* SUPERDMZ_TOKEN = "426bf7a48c34b62c7a6b835f3398a7d5c630eb8a066b1c3f";
+const char* SUPERDMZ_TOKEN = "";
 #define MAX_HISTORY 3
 #define MAX_EVENT_LOG 5
 
@@ -75,7 +75,9 @@ void loadMQTTConfig(); void saveMQTTConfig(); void setupMQTT();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void publishRelayStatus(); void setRelay(bool state); void evaluateRelayState();
 void addEventLog(String event); String getEventLogJSON();
-void saveRelayStateToNVS(); bool loadRelayStateFromNVS(); void handleOTAUpload();
+void saveRelayStateToNVS(); bool loadRelayStateFromNVS(); 
+void handleOTAUpload();
+void handleOtaFinish();
 
 // ===== Setup =====
 void setup() {
@@ -132,7 +134,7 @@ void setup() {
   server.on("/event-log", handleEventLog);
   server.on("/delete-history", HTTP_POST, handleDeleteHistory);
   server.on("/clear-history", HTTP_POST, handleClearHistory);
-  server.on("/api/ota", HTTP_POST, [](){ server.send(200, "text/plain", "OTA Received"); }, handleOTAUpload);
+  server.on("/api/ota", HTTP_POST, handleOtaFinish, handleOTAUpload);
 
   server.onNotFound([]() {
     IPAddress clientIP = server.client().remoteIP();
@@ -209,14 +211,36 @@ void loop() {
 }
 
 // ===== Fungsi =====
+void handleOtaFinish() {
+  bool ok = !Update.hasError();
+  String msg = ok ? "OTA Received" : String("err:") + Update.errorString();
+  
+  // Balas ke SuperDMZ, lalu restart
+  server.send(ok ? 200 : 500, "text/plain", msg);
+  addEventLog("OTA finish: " + msg);
+  if (ok) { 
+    delay(1000); 
+    ESP.restart(); 
+  }
+}
+
 void handleOTAUpload() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) addEventLog("OTA gagal mulai");
+    addEventLog("OTA Start");
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      addEventLog("OTA Begin Failed");
+    }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) Serial.println("OTA write error");
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      addEventLog("OTA Write Failed");
+    }
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (Update.end(true)) { delay(1000); ESP.restart(); }
+    if (Update.end(true)) {
+      addEventLog("OTA Success, menunggu restart...");
+    } else {
+      addEventLog("OTA End Failed: " + String(Update.errorString()));
+    }
   }
 }
 
@@ -451,7 +475,7 @@ void handleRoot() {
     <div id='eventLogList'><p class='small'>Memuat...</p></div>
   </div>
   <div class='card'>
-    <h3>Pengaturan MQTT</h3>
+    <h3>Pengaturan UHUUUUYYYY</h3>
     <div class='indicator'><span id='mqttStatus'>Memuat...</span></div>
     <form action='/save-mqtt' method='POST'>
       <label>Broker</label><input type='text' name='broker' id='broker' value='__MQTT_BROKER__'>
