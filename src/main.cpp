@@ -16,7 +16,7 @@ const char* AP_PASSWORD_DEFAULT = "alphanusa098765";
 const char* MQTT_BROKER_DEFAULT = "202.10.37.231";
 const int   MQTT_PORT_DEFAULT   = 1883;
 const char* MQTT_DEVICE_ID_DEFAULT = "DEV-001";
-const char* SUPERDMZ_TOKEN = "";
+const char* SUPERDMZ_TOKEN = ""; // Pastikan token sesuai
 #define MAX_HISTORY 3
 #define MAX_EVENT_LOG 5
 
@@ -31,6 +31,7 @@ SuperDMZ tunnel;
 
 // ===== State =====
 bool relayOn = false;
+bool localOverrideActive = false; // Pengunci saat tombol lokal ditekan
 String currentAP_SSID = AP_SSID_DEFAULT;
 String currentAP_PASS = AP_PASSWORD_DEFAULT;
 bool staConnected = false;
@@ -41,6 +42,8 @@ bool internetAvailable = false;
 unsigned long lastInternetCheck = 0;
 const unsigned long INTERNET_CHECK_INTERVAL = 30000;
 unsigned long lastWiFiReconnectAttempt = 0;
+
+// ===== State MQTT =====
 String mqttBroker = MQTT_BROKER_DEFAULT;
 int    mqttPort   = MQTT_PORT_DEFAULT;
 String mqttDeviceId = MQTT_DEVICE_ID_DEFAULT;
@@ -48,10 +51,14 @@ String mqttClientId = "";
 bool   mqttConnected = false;
 unsigned long lastMqttReconnect = 0;
 const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
+
+// ===== State Sewa =====
 unsigned long lastActiveUntil = 0;
 unsigned long graceSeconds = 0;
 String overrideMode = "AUTO";
 int lastRev = 0;
+
+// ===== State Fail-Safe =====
 unsigned long lastMqttConnectedTime = 0;
 const unsigned long FAILSAFE_TIMEOUT = 24 * 3600 * 1000;
 bool sudahSinkronWaktu = false;
@@ -75,9 +82,8 @@ void loadMQTTConfig(); void saveMQTTConfig(); void setupMQTT();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void publishRelayStatus(); void setRelay(bool state); void evaluateRelayState();
 void addEventLog(String event); String getEventLogJSON();
-void saveRelayStateToNVS(); bool loadRelayStateFromNVS(); 
-void handleOTAUpload();
-void handleOtaFinish();
+void saveRelayStateToNVS(); bool loadRelayStateFromNVS();
+void handleOTAUpload(); void handleOtaFinish();
 
 // ===== Setup =====
 void setup() {
@@ -209,38 +215,25 @@ void loop() {
   }
   evaluateRelayState();
 }
-
-// ===== Fungsi =====
+// ===== Fungsi Utama =====
 void handleOtaFinish() {
   bool ok = !Update.hasError();
   String msg = ok ? "OTA Received" : String("err:") + Update.errorString();
-  
-  // Balas ke SuperDMZ, lalu restart
   server.send(ok ? 200 : 500, "text/plain", msg);
   addEventLog("OTA finish: " + msg);
-  if (ok) { 
-    delay(1000); 
-    ESP.restart(); 
-  }
+  if (ok) { delay(1000); ESP.restart(); }
 }
 
 void handleOTAUpload() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
     addEventLog("OTA Start");
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-      addEventLog("OTA Begin Failed");
-    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) addEventLog("OTA Begin Failed");
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      addEventLog("OTA Write Failed");
-    }
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) addEventLog("OTA Write Failed");
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (Update.end(true)) {
-      addEventLog("OTA Success, menunggu restart...");
-    } else {
-      addEventLog("OTA End Failed: " + String(Update.errorString()));
-    }
+    if (Update.end(true)) addEventLog("OTA Success, menunggu restart...");
+    else addEventLog("OTA End Failed: " + String(Update.errorString()));
   }
 }
 
@@ -249,6 +242,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (deserializeJson(doc, payload, length)) return;
   String expectedTopic = "unit/" + mqttDeviceId + "/lease/set";
   if (String(topic) == expectedTopic) {
+    localOverrideActive = false; // Buka kunci jika server mengirim data baru
     lastActiveUntil = doc["active_until"] | 0;
     graceSeconds = doc["grace_s"] | 0;
     overrideMode = doc["override"] | "AUTO";
@@ -264,18 +258,42 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 void evaluateRelayState() {
-  bool shouldBeOn = false;
-  unsigned long now = timeClient.getEpochTime();
+  // 1. JIKA USER MENEKAN TOMBOL PAKSA LOKAL, ABAIKAN LOGIKA SERVER
+  if (localOverrideActive) return;
+
+  // 2. JIKA WAKTU BELUM SINKRON ATAU DATA BELUM ADA, JANGAN UBAH RELAY (ANTI-MATI DINI)
   if (!sudahSinkronWaktu) return;
   if (lastActiveUntil == 0 && overrideMode == "AUTO") return;
+
+  bool shouldBeOn = false;
+  unsigned long now = timeClient.getEpochTime();
+
+  // 3. FITUR FAIL-SAFE (Jika server down < 24 jam, paksa nyala)
   if (!mqttConnected && (millis() - lastMqttConnectedTime < FAILSAFE_TIMEOUT)) {
     if (!relayOn) setRelay(true);
     return;
   }
-  if (overrideMode == "ON") shouldBeOn = true;
-  else if (overrideMode == "OFF") shouldBeOn = false;
-  else shouldBeOn = (now < (lastActiveUntil + graceSeconds));
-  if (relayOn != shouldBeOn) { setRelay(shouldBeOn); publishRelayStatus(); }
+
+  // 4. EVALUASI NORMAL
+  if (overrideMode == "ON") {
+    shouldBeOn = true;
+  } else if (overrideMode == "OFF") {
+    shouldBeOn = false;
+  } else {
+    // Mode AUTO: Cek batas waktu sewa + masa tenggang
+    unsigned long powerOffTime = lastActiveUntil + graceSeconds;
+    if (now < powerOffTime) {
+      shouldBeOn = true;
+    } else {
+      shouldBeOn = false;
+    }
+  }
+
+  // 5. EKSEKUSI JIKA STATUS BERUBAH
+  if (relayOn != shouldBeOn) {
+    setRelay(shouldBeOn);
+    publishRelayStatus();
+  }
 }
 
 void publishRelayStatus() {
@@ -305,6 +323,7 @@ void loadMQTTConfig() {
   mqttDeviceId = preferences.getString("device_id", MQTT_DEVICE_ID_DEFAULT);
   preferences.end();
 }
+
 void saveMQTTConfig() {
   preferences.begin("mqtt-config", false);
   preferences.putString("broker", mqttBroker);
@@ -355,6 +374,7 @@ void handleConnectSTA() {
 }
 
 void handleDisconnectSTA() { preferences.begin("wifi-sta", false); preferences.clear(); preferences.end(); WiFi.disconnect(true); ESP.restart(); }
+
 void handleSaveMQTT() {
   if (server.hasArg("broker") && server.hasArg("port") && server.hasArg("device_id")) {
     mqttBroker = server.arg("broker"); mqttPort = server.arg("port").toInt(); mqttDeviceId = server.arg("device_id");
@@ -362,8 +382,22 @@ void handleSaveMQTT() {
   }
 }
 
-void handleForceOn() { setRelay(true); server.sendHeader("Location", "/"); server.send(303); }
-void handleForceOff() { setRelay(false); server.sendHeader("Location", "/"); server.send(303); }
+// --- TOMBOL PAKSA (MENGUNCI LOGIKA) ---
+void handleForceOn() { 
+  localOverrideActive = true; 
+  setRelay(true); 
+  addEventLog("Paksa ON Lokal");
+  server.sendHeader("Location", "/"); 
+  server.send(303); 
+}
+
+void handleForceOff() { 
+  localOverrideActive = true; 
+  setRelay(false); 
+  addEventLog("Paksa OFF Lokal");
+  server.sendHeader("Location", "/"); 
+  server.send(303); 
+}
 
 void handleStatus() {
   String json = "{\"relay\":" + String(relayOn ? "true" : "false") + ",\"sta_connected\":" + String(staConnected ? "true" : "false") +
@@ -386,6 +420,7 @@ void loadHistory() {
   }
   preferences.end();
 }
+
 void saveHistory() {
   preferences.begin("wifi-hist", false); preferences.putInt("count", historyCount);
   for (int i = 0; i < historyCount; i++) {
@@ -395,6 +430,7 @@ void saveHistory() {
   }
   preferences.end();
 }
+
 void addToHistory(String ssid, String pass, String status) {
   int existingIdx = -1;
   for (int i = 0; i < historyCount; i++) { if (histories[i].ssid == ssid) { existingIdx = i; break; } }
@@ -408,11 +444,13 @@ void addToHistory(String ssid, String pass, String status) {
   histories[0].ssid = ssid; histories[0].pass = pass; histories[0].status = status;
   saveHistory();
 }
+
 void deleteHistoryByIndex(int index) {
   if (index < 0 || index >= historyCount) return;
   for (int i = index; i < historyCount - 1; i++) histories[i] = histories[i + 1];
   historyCount--; saveHistory();
 }
+
 String getHistoryJSON() {
   String json = "[";
   for (int i = 0; i < historyCount; i++) {
@@ -427,6 +465,7 @@ void addEventLog(String event) {
   eventLogs[0].event = event; eventLogs[0].timestamp = millis() / 1000;
   if (eventLogCount < MAX_EVENT_LOG) eventLogCount++;
 }
+
 String getEventLogJSON() {
   String json = "[";
   for (int i = 0; i < eventLogCount; i++) {
@@ -475,7 +514,7 @@ void handleRoot() {
     <div id='eventLogList'><p class='small'>Memuat...</p></div>
   </div>
   <div class='card'>
-    <h3>Pengaturan UHUUUUYYYY</h3>
+    <h3>Pengaturan MQTT</h3>
     <div class='indicator'><span id='mqttStatus'>Memuat...</span></div>
     <form action='/save-mqtt' method='POST'>
       <label>Broker</label><input type='text' name='broker' id='broker' value='__MQTT_BROKER__'>
